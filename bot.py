@@ -85,7 +85,7 @@ PC_STATUS_KOMMUNIST = {place: None for places in KOMMUNIST_ZONES.values() for pl
 CLUBS = {
     "loc_greyder": {
         "name": "📍 Грейдерная, 1 (2 этаж)",
-        "phone": "+7 960 856 06 14",
+        "phone": "89608560614",
         "admin_tg": "@NextGenAst",
         "zones": GREYDER_ZONES,
         "pc_status": PC_STATUS_GREYDER,
@@ -97,7 +97,7 @@ CLUBS = {
             "• Видеокарты: RTX 3060 Ti\n"
             "• Оперативная память: 16 GB RAM\n"
             "• Мониторы: 165Hz\n\n"
-            "🔥 <b>MVP-зона (Solo / Duo / Trio):</b>\n"
+            "🔥 <b>MVP-зона (Solo / Duo):</b>\n"
             "• Видеокарты: RTX 3070 Ti / RTX 4070 Ti\n"
             "• Оперативная память: 16 GB RAM\n"
             "• Мониторы: 240Hz – 320Hz\n"
