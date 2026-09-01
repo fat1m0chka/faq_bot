@@ -55,8 +55,8 @@ dp = Dispatcher(storage=MemoryStorage())
 GREYDER_ZONES = {
     "VIP Пятерка": ["4", "5", "6", "7", "8"],
     "VIP Четверка": ["9", "10", "11", "12"],
-    "MVP Trio (Тройка)": ["13", "14", "15"],
-    "MVP Duo (Двойка)": ["2", "3"],
+    "VIP Trio": ["13", "14", "15"],
+    "MVP Duo": ["2", "3"],
     "MVP Solo 1": ["16"],
     "MVP Solo 2": ["17"],
     "🎮 Зона PlayStation 5": ["PS5 №1", "PS5 №2"],
