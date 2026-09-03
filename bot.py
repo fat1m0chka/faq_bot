@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -43,7 +43,7 @@ BRANCH_RECIPIENTS = {
 
 ALL_ADMIN_IDS = {MY_TELEGRAM_ID, GREYDER_ADMIN_ID, KOMMUNIST_ADMIN_ID}
 USERS_DB = set(ALL_ADMIN_IDS)
-PENDING_ORDERS = {}  # Временный буфер заявок для SmartShell: {client_id: data}
+PENDING_ORDERS = {}
 
 CONFIG_FILE = "config_smartshell.json"
 SMARTSHELL_URL = "https://billing.smartshell.gg/api/graphql"
@@ -74,7 +74,7 @@ def save_smartshell_config(data: dict):
 SMARTSHELL_DATA = load_smartshell_config()
 
 # =====================================================================
-# 2. МОДЕЛЬ ДАННЫХ И КАРТЫ ЗАЛОВ
+# 2. КАРТЫ ЗАЛОВ
 # =====================================================================
 GREYDER_ZONES = {
     "VIP Пятерка": ["4", "5", "6", "7", "8"],
@@ -181,7 +181,7 @@ class SmartShellAPI:
         if not cid or not login or not password:
             return False
 
-        if self.token and self.token_expire_time and datetime.now() < self.token_expire_time:
+        if self.token and self.token_expire_time and datetime.now(timezone.utc) < self.token_expire_time:
             return True
 
         headers = {"Content-Type": "application/json", "User-Agent": f"company_id={cid}"}
@@ -203,7 +203,7 @@ class SmartShellAPI:
                     return False
 
                 self.token = data["data"]["login"]["access_token"]
-                self.token_expire_time = datetime.now() + timedelta(hours=10)
+                self.token_expire_time = datetime.now(timezone.utc) + timedelta(hours=10)
                 return True
         except Exception as err:
             logging.error(f"Авторизация в SmartShell [{self.loc_key}] завершилась с ошибкой: {err}")
@@ -239,7 +239,7 @@ class SmartShellAPI:
                     "User-Agent": f"company_id={cid}",
                     "Authorization": f"Bearer {self.token}",
                 }
-                async with session.post(SMARTSHELL_URL, json={"query": query}, headers=headers, timeout=6) as resp:
+                async with session.post(SMARTSHELL_URL, json={"query": query}, headers=headers, timeout=5) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         hosts = data.get("data", {}).get("hosts", []) or []
@@ -263,7 +263,10 @@ class SmartShellAPI:
         if not cid:
             return False, "SmartShell не привязан к этому клубу."
 
-        dt_from = datetime.now() + timedelta(minutes=15)
+        # Исправление бага "from must be after":
+        # Берем чистое время UTC и добавляем безопасный сдвиг вперед (+20 минут), чтобы не попасть в прошлое
+        now_utc = datetime.now(timezone.utc)
+        dt_from = now_utc + timedelta(minutes=20)
         dt_to = dt_from + timedelta(hours=2)
 
         iso_from = dt_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -280,7 +283,7 @@ class SmartShellAPI:
                 host_ids.append(int(hid))
 
         if not host_ids:
-            return False, "Выбранные ПК не найдены в списке оборудования SmartShell."
+            return False, "Выбранные ПК не найдены в базе оборудования."
 
         mutation = """
         mutation CreateBooking($input: BookingInput!) {
@@ -314,7 +317,7 @@ class SmartShellAPI:
                     if "errors" in res:
                         err_msg = res["errors"][0].get("message", "Ошибка API")
                         return False, f"❌ Отказ SmartShell: {err_msg}"
-                    
+
                     booking_id = res.get("data", {}).get("createBooking", {}).get("id")
                     status_res = res.get("data", {}).get("createBooking", {}).get("status", "OK")
                     return True, f"✅ Создана бронь в SmartShell: #{booking_id} ({status_res})"
@@ -329,7 +332,7 @@ CLIENTS = {
 }
 
 # =====================================================================
-# 4. СОСТОЯНИЯ FSM (МАШИНА СОСТОЯНИЙ)
+# 4. FSM СОСТОЯНИЯ
 # =====================================================================
 class BookingStates(StatesGroup):
     location = State()
@@ -360,8 +363,10 @@ class BroadcastStates(StatesGroup):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+
 def is_super_admin(user: types.User) -> bool:
     return user.id == MY_TELEGRAM_ID
+
 
 def is_admin(user: types.User) -> bool:
     return user.id in ALL_ADMIN_IDS
@@ -576,7 +581,7 @@ async def process_feedback(message: types.Message, state: FSMContext):
     await message.answer("Спасибо! Передали заявку админам филиала 🙌", reply_markup=get_main_keyboard(message.from_user))
 
 # =====================================================================
-# 7. ПРОЦЕСС БРОНИРОВАНИЯ (С ЗАПРОСОМ ИМЕНИ)
+# 7. ПРОЦЕСС БРОНИРОВАНИЯ
 # =====================================================================
 @dp.message(F.text == "⚡ Забронировать ПК / PS5 / VR 📍")
 async def start_booking(message: types.Message, state: FSMContext):
@@ -587,8 +592,8 @@ async def start_booking(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("bookloc_"), BookingStates.location)
 async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
     club_key = callback.data.replace("bookloc_", "")
-    await callback.message.edit_text("⏳ <i>Синхронизируем доступность ПК со SmartShell...</i>", parse_mode="HTML")
-
+    
+    # Сразу получаем реальные статусы
     client = CLIENTS.get(club_key)
     real_status = await client.get_hosts_status() if client else {}
 
@@ -596,7 +601,7 @@ async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.zone)
 
     await callback.message.edit_text(
-        f"<b>{CLUBS[club_key]['name']}</b>\nВыберите свободную зону, PS5 или VR:",
+        f"<b>{CLUBS[club_key]['name']}</b>\nГде планируете тащить? Выбирайте зону:",
         reply_markup=get_club_zones_keyboard(club_key, real_status),
         parse_mode="HTML",
     )
@@ -605,7 +610,7 @@ async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("zonebusy_"), BookingStates.zone)
 async def zone_busy_alert(callback: CallbackQuery):
-    await callback.answer("❌ Вся эта зона сейчас занята гостями в клубе!", show_alert=True)
+    await callback.answer("❌ Вся эта зона сейчас наглухо занята! Выберите другую.", show_alert=True)
 
 
 @dp.callback_query(F.data == "back_to_zones", BookingStates.selecting_pcs)
@@ -633,7 +638,7 @@ async def choose_pc_in_zone(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.selecting_pcs)
 
     await callback.message.edit_text(
-        f"Выбрано: <b>{zone_name}</b>\nЗеленые места свободны. Нажмите на нужные (можно несколько):",
+        f"Комната: <b>{zone_name}</b>\nЗеленые места свободны. Кликайте на нужные (можно сразу несколько):",
         reply_markup=get_multi_pcs_keyboard(club_key, zone_name, [], real_status),
         parse_mode="HTML",
     )
@@ -646,7 +651,7 @@ async def pc_busy_alert(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     real_status = data.get("real_status", {})
     until = real_status.get(normalize_alias(place_name), "занято")
-    await callback.answer(f"❌ Место {place_name} сейчас занято ({until})!", show_alert=True)
+    await callback.answer(f"❌ Место {place_name} сейчас занято ({until})! Выберите зеленое.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("togglepc_"), BookingStates.selecting_pcs)
@@ -683,7 +688,7 @@ async def finish_selection_handler(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.delete()
     await callback.message.answer(
-        f"Выбрано мест ({len(selected)} шт.): <b>{places_str}</b>\n\n👤 <b>На какое имя оформить бронь?</b> (Например: <i>Александр</i>):",
+        f"Заряжаем места ({len(selected)} шт.): <b>{places_str}</b>\n\n👤 <b>На какое имя оформить бронь?</b>",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -695,7 +700,7 @@ async def booking_client_name(message: types.Message, state: FSMContext):
     await state.update_data(client_name=message.text.strip())
     await state.set_state(BookingStates.date_time)
     await message.answer(
-        "🕒 <b>Укажите дату и время брони</b> (например: <i>Сегодня к 20:00</i>):",
+        "🕒 <b>К какому времени подтянетесь?</b> (например: <i>Сегодня к 20:30</i>):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -706,7 +711,7 @@ async def booking_datetime(message: types.Message, state: FSMContext):
     await state.update_data(date_time=message.text.strip())
     await state.set_state(BookingStates.duration)
     await message.answer(
-        "⏳ <b>На сколько часов бронь?</b> (например: <i>3 часа</i> или <i>Пакет Ночь</i>):",
+        "⏳ <b>На сколько часов садитесь?</b> (например: <i>3 часа</i> / <i>Пакет Ночь</i>):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -717,7 +722,7 @@ async def booking_duration(message: types.Message, state: FSMContext):
     await state.update_data(duration=message.text.strip())
     await state.set_state(BookingStates.phone)
     await message.answer(
-        "📞 <b>Укажите ваш номер телефона для связи:</b>",
+        "📞 <b>Оставьте номер телефона для связи:</b>",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -744,7 +749,7 @@ async def booking_phone(message: types.Message, state: FSMContext):
     }
 
     await message.answer(
-        "✅ <b>Заявка принята!</b> Ожидайте подтверждения от администратора.",
+        "🚀 <b>Заявка улетела админу!</b> Сейчас подтвердим и заброним место.",
         reply_markup=get_main_keyboard(user),
         parse_mode="HTML",
     )
@@ -802,7 +807,7 @@ async def admin_approve(callback: CallbackQuery):
     await callback.message.edit_text(new_text, parse_mode="HTML")
 
     try:
-        await bot.send_message(chat_id=client_id, text="🎉 <b>Ваша бронь подтверждена!</b> Ждем вас в клубе.", parse_mode="HTML")
+        await bot.send_message(chat_id=client_id, text="🎉 <b>Ваша бронь подтверждена!</b> Ждем в клубе, приятной игры!", parse_mode="HTML")
     except Exception:
         pass
     await callback.answer("Бронь зафиксирована!")
@@ -822,7 +827,7 @@ async def admin_reject(callback: CallbackQuery):
         parse_mode="HTML",
     )
     try:
-        await bot.send_message(chat_id=client_id, text="😔 К сожалению, на выбранное время мест нет.", parse_mode="HTML")
+        await bot.send_message(chat_id=client_id, text="😔 К сожалению, на выбранное время все места заняты.", parse_mode="HTML")
     except Exception:
         pass
     await callback.answer("Заявка отклонена!")
