@@ -29,10 +29,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
+BOT_TOKEN = "8991533473:AAGhsAChSIVcOsbKjzCbhrSx7DFqGro2lPQ"
 
 # Числовые Telegram ID
-MY_TELEGRAM_ID = 123456789         # Владелец (@M1lfohks)
+MY_TELEGRAM_ID = 5390254050         # Владелец (@M1lfohks)
 GREYDER_ADMIN_ID = 7508100064      # Админ Грейдерной (@NextGenAst)
 KOMMUNIST_ADMIN_ID = 222222222     # Админ Коммунистической (@genesisvrast)
 
