@@ -26,23 +26,19 @@ logging.basicConfig(
 
 BOT_TOKEN = "8991533473:AAGhsAChSIVcOsbKjzCbhrSx7DFqGro2lPQ"
 
-# Числовой ID владельца (из @userinfobot)
-MY_TELEGRAM_ID = 5390254050  
+# ⚠️ ЧИСЛОВЫЕ ID АДМИНИСТРАТОРОВ
+MY_TELEGRAM_ID = 5390254050             
+GREYDER_ADMIN_ID = 7508100064          
+KOMMUNIST_ADMIN_ID = 222222222         
 
-SUPER_ADMIN_USERNAME = "m1lfohks"
-
-# Закрепление админов за точками (в нижнем регистре без @)
-BRANCH_ADMINS = {
-    "loc_greyder": {"nextgenast"},
-    "loc_kommunist": {"genesisvrast"}
+# Жесткое разделение получателей:
+BRANCH_RECIPIENTS = {
+    "loc_greyder": {GREYDER_ADMIN_ID, MY_TELEGRAM_ID},
+    "loc_kommunist": {KOMMUNIST_ADMIN_ID, MY_TELEGRAM_ID},
 }
 
-# Все админы системы
-ALL_ADMIN_USERNAMES = {SUPER_ADMIN_USERNAME, "nextgenast", "genesisvrast"}
-
-USERS_DB = {MY_TELEGRAM_ID}
-# Словарь для связи юзернейма и числового chat_id: {"username": chat_id}
-ACTIVE_ADMIN_CHATS = {}
+ALL_ADMIN_IDS = {MY_TELEGRAM_ID, GREYDER_ADMIN_ID, KOMMUNIST_ADMIN_ID}
+USERS_DB = set(ALL_ADMIN_IDS)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -55,8 +51,8 @@ dp = Dispatcher(storage=MemoryStorage())
 GREYDER_ZONES = {
     "VIP Пятерка": ["4", "5", "6", "7", "8"],
     "VIP Четверка": ["9", "10", "11", "12"],
-    "VIP Trio": ["13", "14", "15"],
-    "MVP Duo": ["2", "3"],
+    "MVP Trio (Тройка)": ["13", "14", "15"],
+    "MVP Duo (Двойка)": ["2", "3"],
     "MVP Solo 1": ["16"],
     "MVP Solo 2": ["17"],
     "🎮 Зона PlayStation 5": ["PS5 №1", "PS5 №2"],
@@ -85,7 +81,7 @@ PC_STATUS_KOMMUNIST = {place: None for places in KOMMUNIST_ZONES.values() for pl
 CLUBS = {
     "loc_greyder": {
         "name": "📍 Грейдерная, 1 (2 этаж)",
-        "phone": "89608560614",
+        "phone": "+7 960 856 06 14",
         "admin_tg": "@NextGenAst",
         "zones": GREYDER_ZONES,
         "pc_status": PC_STATUS_GREYDER,
@@ -97,7 +93,7 @@ CLUBS = {
             "• Видеокарты: RTX 3060 Ti\n"
             "• Оперативная память: 16 GB RAM\n"
             "• Мониторы: 165Hz\n\n"
-            "🔥 <b>MVP-зона (Solo / Duo):</b>\n"
+            "🔥 <b>MVP-зона (Solo / Duo / Trio):</b>\n"
             "• Видеокарты: RTX 3070 Ti / RTX 4070 Ti\n"
             "• Оперативная память: 16 GB RAM\n"
             "• Мониторы: 240Hz – 320Hz\n"
@@ -132,31 +128,10 @@ CLUBS = {
 }
 
 def is_super_admin(user: types.User) -> bool:
-    if user.id == MY_TELEGRAM_ID:
-        return True
-    return bool(user.username and user.username.lower() == SUPER_ADMIN_USERNAME)
+    return user.id == MY_TELEGRAM_ID
 
 def is_admin(user: types.User) -> bool:
-    if is_super_admin(user):
-        return True
-    return bool(user.username and user.username.lower() in ALL_ADMIN_USERNAMES)
-
-# Функция поиска получателей уведомлений для конкретной точки
-def get_target_admin_chats(loc_key: str) -> set:
-    target_chats = set()
-    # Всегда отправляем главному
-    if MY_TELEGRAM_ID:
-        target_chats.add(MY_TELEGRAM_ID)
-    if SUPER_ADMIN_USERNAME in ACTIVE_ADMIN_CHATS:
-        target_chats.add(ACTIVE_ADMIN_CHATS[SUPER_ADMIN_USERNAME])
-        
-    # Добавляем админов конкретного филиала
-    branch_admins = BRANCH_ADMINS.get(loc_key, set())
-    for adm_user in branch_admins:
-        if adm_user in ACTIVE_ADMIN_CHATS:
-            target_chats.add(ACTIVE_ADMIN_CHATS[adm_user])
-            
-    return target_chats
+    return user.id in ALL_ADMIN_IDS
 
 # Состояния FSM
 class BookingStates(StatesGroup):
@@ -178,11 +153,6 @@ class FeedbackStates(StatesGroup):
 
 class BroadcastStates(StatesGroup):
     message = State()
-
-class ManageAdminStates(StatesGroup):
-    add_branch = State()
-    add_username = State()
-    del_username = State()
 
 # ==========================================
 # 4. КЛАВИАТУРЫ
@@ -275,17 +245,10 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
 async def cmd_start_or_back(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    username = message.from_user.username.lower() if message.from_user.username else ""
-    
     USERS_DB.add(user_id)
     
-    # Фиксируем активного админа для отправки брони в ЛС
     if is_admin(message.from_user):
-        if username:
-            ACTIVE_ADMIN_CHATS[username] = user_id
-        if user_id == MY_TELEGRAM_ID:
-            ACTIVE_ADMIN_CHATS[SUPER_ADMIN_USERNAME] = user_id
-        logging.info(f"Администратор подключен: @{username} (ID: {user_id})")
+        logging.info(f"Администратор написал боту: ID={user_id}, @{message.from_user.username}")
 
     menu = get_main_keyboard(message.from_user)
     await message.answer(
@@ -410,18 +373,17 @@ async def process_feedback(message: types.Message, state: FSMContext):
         f"📝 <b>Игра:</b> <i>{message.text}</i>"
     )
     
-    # Отправка строго ответственным админам этого филиала
-    recipients = get_target_admin_chats(loc_key)
+    recipients = BRANCH_RECIPIENTS.get(loc_key, {MY_TELEGRAM_ID})
     for adm_chat_id in recipients:
         try:
             await bot.send_message(chat_id=adm_chat_id, text=card, parse_mode="HTML")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Не удалось доставить запрос на игру {adm_chat_id}: {e}")
 
     await message.answer("Спасибо! Передали заявку админам филиала 🙌", reply_markup=get_main_keyboard(user))
 
 # ==========================================
-# 6. БРОНИРОВАНИЕ С РАЗДЕЛЕНИЕМ ПО ТОЧКАМ
+# 6. БРОНИРОВАНИЕ С ЧЕТКИМ РАЗДЕЛЕНИЕМ ПО ТОЧКАМ
 # ==========================================
 
 @dp.message(F.text == "⚡ Забронировать ПК / PS5 / VR 📍")
@@ -569,17 +531,15 @@ async def booking_phone(message: types.Message, state: FSMContext):
         f"⏳ <b>Длительность:</b> {data['duration']}"
     )
     
-    logging.info(f"Заявка оформлена: {data['location']}, {data['pc_number']}")
+    recipients = BRANCH_RECIPIENTS.get(loc_key, {MY_TELEGRAM_ID})
+    logging.info(f"👉 Отправка брони филиала {loc_key} на ID адресатов: {recipients}")
 
-    # Маршрутизация: отправляем только ответственным админам данной точки
-    recipients = get_target_admin_chats(loc_key)
-    logging.info(f"Отправка заявки филиала {loc_key} получателям: {recipients}")
-    
     for adm_chat_id in recipients:
         try:
             await bot.send_message(chat_id=adm_chat_id, text=admin_card, reply_markup=admin_kb, parse_mode="HTML")
+            logging.info(f"✅ Доставлено админу ID={adm_chat_id}")
         except Exception as e:
-            logging.error(f"Ошибка отправки админу {adm_chat_id}: {e}")
+            logging.error(f"❌ Ошибка отправки админу ID={adm_chat_id}: {e}")
 
 # ==========================================
 # 7. ДЕЙСТВИЯ АДМИНИСТРАТОРА
@@ -630,9 +590,6 @@ async def admin_panel(message: types.Message):
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="adm_broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")]
     ]
-    if is_super_admin(message.from_user):
-        buttons.append([InlineKeyboardButton(text="👑 Управление админами", callback_data="adm_manage_team")])
-
     await message.answer("🛠 <b>Панель управления сетью:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("adm_manage_loc_"))
@@ -716,99 +673,14 @@ async def adm_reset_all(callback: CallbackQuery):
     callback.data = f"adm_manage_{club_key}"
     await adm_manage_pcs_list(callback)
 
-# Управление командой админов
-@dp.callback_query(F.data == "adm_manage_team")
-async def manage_team_menu(callback: CallbackQuery):
-    if not is_super_admin(callback.from_user):
-        return
-    
-    text = "👑 <b>Администраторы по филиалам:</b>\n\n"
-    text += f"⭐️ <b>Главный владелец:</b> @{SUPER_ADMIN_USERNAME}\n"
-    text += "📍 <b>Грейдерная, 1:</b> " + ", ".join([f"@{u}" for u in BRANCH_ADMINS["loc_greyder"]]) + "\n"
-    text += "📍 <b>Коммунистическая, 7:</b> " + ", ".join([f"@{u}" for u in BRANCH_ADMINS["loc_kommunist"]]) + "\n"
-    
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Назначить админа", callback_data="adm_add_start")],
-            [InlineKeyboardButton(text="➖ Снять админа", callback_data="adm_del_start")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_action")]
-        ]
-    )
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "adm_add_start")
-async def add_admin_choose_branch(callback: CallbackQuery, state: FSMContext):
-    if not is_super_admin(callback.from_user):
-        return
-    await state.set_state(ManageAdminStates.add_branch)
-    await callback.message.edit_text("Выберите филиал для нового администратора:", reply_markup=get_location_select_kb("admsetloc"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("admsetloc_"), ManageAdminStates.add_branch)
-async def add_admin_ask_user(callback: CallbackQuery, state: FSMContext):
-    branch_key = callback.data.replace("admsetloc_", "")
-    await state.update_data(target_branch=branch_key)
-    await state.set_state(ManageAdminStates.add_username)
-    await callback.message.answer(
-        f"Введите юзернейм нового админа для <b>{CLUBS[branch_key]['name']}</b> (без @):",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(ManageAdminStates.add_username)
-async def add_admin_finish(message: types.Message, state: FSMContext):
-    if not is_super_admin(message.from_user):
-        return
-    data = await state.get_data()
-    branch_key = data["target_branch"]
-    new_user = message.text.replace("@", "").strip().lower()
-    
-    BRANCH_ADMINS[branch_key].add(new_user)
-    ALL_ADMIN_USERNAMES.add(new_user)
-    await state.clear()
-    
-    await message.answer(
-        f"✅ Пользователь <b>@{new_user}</b> назначен администратором точки <b>{CLUBS[branch_key]['name']}</b>!",
-        reply_markup=get_main_keyboard(message.from_user),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "adm_del_start")
-async def del_admin_start(callback: CallbackQuery, state: FSMContext):
-    if not is_super_admin(callback.from_user):
-        return
-    await state.set_state(ManageAdminStates.del_username)
-    await callback.message.answer("Введите юзернейм админа для снятия прав (без @):", reply_markup=get_cancel_keyboard())
-    await callback.answer()
-
-@dp.message(ManageAdminStates.del_username)
-async def del_admin_finish(message: types.Message, state: FSMContext):
-    if not is_super_admin(message.from_user):
-        return
-    del_user = message.text.replace("@", "").strip().lower()
-    if del_user == SUPER_ADMIN_USERNAME:
-        await message.answer("❌ Нельзя снять главного владельца!")
-    else:
-        for b in BRANCH_ADMINS:
-            BRANCH_ADMINS[b].discard(del_user)
-        ALL_ADMIN_USERNAMES.discard(del_user)
-        ACTIVE_ADMIN_CHATS.pop(del_user, None)
-        await message.answer(f"🗑 Пользователь <b>@{del_user}</b> удален из администраторов.", parse_mode="HTML")
-        
-    await state.clear()
-    await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user))
-
 @dp.callback_query(F.data == "adm_stats")
 async def show_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user):
         return
-    active_adm_str = ", ".join([f"@{u}" for u in ACTIVE_ADMIN_CHATS.keys()]) if ACTIVE_ADMIN_CHATS else "нет"
     await callback.message.answer(
         f"📊 <b>Статистика сети:</b>\n\n"
         f"👥 Всего пользователей бота: <b>{len(USERS_DB)}</b> чел.\n"
-        f"🟢 Админов онлайн в ЛС: <b>{len(ACTIVE_ADMIN_CHATS)}</b> ({active_adm_str})",
+        f"Администраторов в конфиге: <b>{len(ALL_ADMIN_IDS)}</b>",
         parse_mode="HTML"
     )
     await callback.answer()
