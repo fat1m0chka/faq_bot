@@ -3,6 +3,7 @@ import logging
 import sys
 import aiohttp
 import json
+import re
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -20,7 +21,7 @@ from aiogram.types import (
 )
 
 # ==========================================
-# 1. ЛОГИРОВАНИЕ И БАЗОВЫЕ НАСТРОЙКИ
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ И ТОКЕНОВ
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -28,10 +29,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-BOT_TOKEN = "8991533473:AAGhsAChSIVcOsbKjzCbhrSx7DFqGro2lPQ"
+BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
 
-# Числовые Telegram ID для уведомлений
-MY_TELEGRAM_ID = 5390254050         # Владелец (@M1lfohks)
+# Числовые Telegram ID
+MY_TELEGRAM_ID = 123456789         # Владелец (@M1lfohks)
 GREYDER_ADMIN_ID = 7508100064      # Админ Грейдерной (@NextGenAst)
 KOMMUNIST_ADMIN_ID = 222222222     # Админ Коммунистической (@genesisvrast)
 
@@ -47,9 +48,25 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ==========================================
-# 2. ИНТЕГРАЦИЯ С SMARTSHELL API
+# 2. НОРМАЛИЗАЦИЯ И ИНТЕГРАЦИЯ С SMARTSHELL
 # ==========================================
 SMARTSHELL_URL = "https://billing.smartshell.gg/api/graphql"
+
+def normalize_alias(name: str) -> str:
+    """Приводит имена вроде 'VIP 12', 'Vip 4', 'MVP1', 'PS5' к единому ключу"""
+    s = str(name).strip().upper()
+    s = s.replace("№", "").replace(" ", "")
+    # Оставляем только суть: если это цифры или PS5/VR
+    if "PS5" in s:
+        return "PS5"
+    if "VR" in s:
+        match = re.search(r"\d+", s)
+        return f"VR{match.group()}" if match else "VR"
+    # Для компов извлекаем просто номер
+    match = re.search(r"\d+", s)
+    if match:
+        return match.group()
+    return s
 
 class SmartShellAPI:
     def __init__(self, company_id: int, login_phone: str, password: str):
@@ -64,7 +81,6 @@ class SmartShellAPI:
         }
 
     async def ensure_auth(self, session: aiohttp.ClientSession) -> bool:
-        """Авторизация и сохранение JWT-токена"""
         now = datetime.now()
         if self.token and self.token_expire_time and now < self.token_expire_time:
             return True
@@ -87,7 +103,7 @@ class SmartShellAPI:
         try:
             async with session.post(SMARTSHELL_URL, json={"query": mutation, "variables": variables}, headers=self.headers, timeout=5) as resp:
                 if resp.status != 200:
-                    logging.error(f"SmartShell Login HTTP Error {resp.status}")
+                    logging.error(f"SmartShell Login Error HTTP {resp.status}")
                     return False
                 data = await resp.json()
                 if "errors" in data:
@@ -96,16 +112,15 @@ class SmartShellAPI:
 
                 self.token = data["data"]["login"]["access_token"]
                 self.headers["Authorization"] = f"Bearer {self.token}"
-                # Считаем токен валидным в течение 12 часов
                 self.token_expire_time = datetime.now() + timedelta(hours=12)
-                logging.info(f"SmartShell: токен успешно обновлен для company_id={self.company_id}")
+                logging.info(f"SmartShell авторизован для company_id={self.company_id}")
                 return True
         except Exception as e:
-            logging.error(f"SmartShell connection exception: {e}")
+            logging.error(f"Исключение при входе в SmartShell: {e}")
             return False
 
     async def get_hosts_status(self) -> dict:
-        """Возвращает словарь: {alias_места: "до HH:MM" или None}"""
+        """Возвращает: {normalized_key: 'до ~HH:MM' или None}"""
         status_map = {}
         if not self.company_id or not self.login_phone:
             return status_map
@@ -133,25 +148,25 @@ class SmartShellAPI:
                         data = await resp.json()
                         hosts = data.get("data", {}).get("hosts", []) or []
                         for h in hosts:
-                            alias = str(h.get("alias", "")).strip()
+                            raw_alias = h.get("alias", "")
+                            key = normalize_alias(raw_alias)
                             sessions = h.get("client_sessions", []) or []
-                            # Находим сессию с активным таймером
                             active = [s for s in sessions if s.get("time_left") and s.get("time_left") > 0]
                             if active:
                                 sec_left = active[0]["time_left"]
                                 end_dt = datetime.now() + timedelta(seconds=sec_left)
-                                status_map[alias] = f"до ~{end_dt.strftime('%H:%M')}"
+                                status_map[key] = f"до ~{end_dt.strftime('%H:%M')}"
                             else:
-                                status_map[alias] = None
+                                status_map[key] = None
         except Exception as e:
-            logging.error(f"Ошибка получения хостов SmartShell: {e}")
+            logging.error(f"Ошибка запроса хостов SmartShell: {e}")
 
         return status_map
 
 # Клиенты SmartShell по филиалам
 SMARTSHELL_CLIENTS = {
     "loc_greyder": SmartShellAPI(3489, "79968370695", "йфцыув321"),
-    "loc_kommunist": SmartShellAPI(0, "", "")  # Впишете данные когда будет доступ
+    "loc_kommunist": SmartShellAPI(0, "", "")  # Добавите данные позже
 }
 
 # ==========================================
@@ -160,11 +175,12 @@ SMARTSHELL_CLIENTS = {
 GREYDER_ZONES = {
     "VIP Пятерка": ["4", "5", "6", "7", "8"],
     "VIP Четверка": ["9", "10", "11", "12"],
-    "MVP Trio (Тройка)": ["13", "14", "15"],
-    "MVP Duo (Двойка)": ["2", "3"],
-    "MVP Solo 1": ["16"],
-    "MVP Solo 2": ["17"],
-    "🎮 Зона PlayStation 5": ["PS5 №1", "PS5 №2"],
+    "VIP Тройка": ["13", "14", "15"],
+    "VIP Одиночка 17": ["17"],
+    "MVP Solo 1": ["1"],
+    "MVP Duo (2, 3)": ["2", "3"],
+    "MVP Solo 16": ["16"],
+    "🎮 Зона PlayStation 5": ["PS5"],
 }
 
 KOMMUNIST_ZONES = {
@@ -176,8 +192,8 @@ KOMMUNIST_ZONES = {
     "VIP Одиночка 2 (ПК 18)": ["18"],
     "Bootcamp 2 (ПК 19-23)": ["19", "20", "21", "22", "23"],
     "Bootcamp 3 (ПК 24-28)": ["24", "25", "26", "27", "28"],
-    "🎮 Зона PlayStation 5": ["PS5 №1"],
-    "🥽 VR Площадки (4 зоны)": ["VR №1", "VR №2", "VR №3", "VR №4"],
+    "🎮 Зона PlayStation 5": ["PS5"],
+    "🥽 VR Площадки (4 зоны)": ["VR 1", "VR 2", "VR 3", "VR 4"],
 }
 
 CLUBS = {
@@ -199,7 +215,7 @@ CLUBS = {
             "• Оперативная память: 16 GB RAM\n"
             "• Мониторы: 240Hz – 320Hz\n"
             "• Периферия: Фулл беспроводные девайсы\n\n"
-            "🎮 <b>Консоли:</b> 2x PlayStation 5\n\n"
+            "🎮 <b>Консоли:</b> PlayStation 5\n\n"
             "📄 <i>Прайс-лист прикреплен на фото выше 👆</i>"
         ),
     },
@@ -220,7 +236,7 @@ CLUBS = {
             "• Видеокарты: RTX 5060 Ti\n"
             "• Память: 32 GB RAM\n"
             "• Мониторы: 280Hz / 360Hz\n\n"
-            "🎮 <b>Консоли:</b> 1x PlayStation 5\n"
+            "🎮 <b>Консоли:</b> PlayStation 5\n"
             "🥽 <b>Виртуальная реальность:</b> 4x VR-площадки\n\n"
             "📄 <i>Прайс-лист прикреплен на фото выше 👆</i>"
         ),
@@ -230,7 +246,6 @@ CLUBS = {
 def is_admin(user: types.User) -> bool:
     return user.id in ALL_ADMIN_IDS
 
-# Состояния FSM
 class BookingStates(StatesGroup):
     location = State()
     zone = State()
@@ -247,7 +262,7 @@ class BroadcastStates(StatesGroup):
     message = State()
 
 # ==========================================
-# 4. ДИНАМИЧЕСКИЕ КЛАВИАТУРЫ (ПО SMARTSHELL)
+# 4. КЛАВИАТУРЫ С ЖИВОЙ ПРОВЕРКОЙ
 # ==========================================
 def get_main_keyboard(user: types.User) -> ReplyKeyboardMarkup:
     kb = [
@@ -266,15 +281,14 @@ def get_location_select_kb(action_prefix: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# Клавиатура зон с проверкой занятости по данным SmartShell
 def get_club_zones_keyboard(club_key: str, real_status: dict) -> InlineKeyboardMarkup:
     club = CLUBS[club_key]
     zones = club["zones"]
     
     buttons = []
     for zone_name, places in zones.items():
-        # Считаем сколько мест занято в шелле
-        busy_places = [p for p in places if real_status.get(p) is not None]
+        # Считаем занятые через нормализацию
+        busy_places = [p for p in places if real_status.get(normalize_alias(p)) is not None]
         
         if len(busy_places) == len(places):
             btn_text = f"🔒 {zone_name} (занята)"
@@ -289,14 +303,14 @@ def get_club_zones_keyboard(club_key: str, real_status: dict) -> InlineKeyboardM
     buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_action")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Клавиатура конкретных мест внутри зоны со статусом из SmartShell
 def get_multi_pcs_keyboard(club_key: str, zone_name: str, selected_list: list, real_status: dict) -> InlineKeyboardMarkup:
     club = CLUBS[club_key]
     places = club["zones"][zone_name]
     
     buttons = []
     for place in places:
-        busy_info = real_status.get(place)
+        norm_key = normalize_alias(place)
+        busy_info = real_status.get(norm_key)
         prefix = "ПК" if "PS5" not in place and "VR" not in place else ""
         label = f"{prefix} {place}".strip()
         
@@ -483,7 +497,7 @@ async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
     club_key = callback.data.replace("bookloc_", "")
     await callback.message.edit_text("⏳ <i>Синхронизируем доступность ПК со SmartShell...</i>", parse_mode="HTML")
 
-    # Опрашиваем SmartShell
+    # Получаем статусы с сервера SmartShell
     ss_client = SMARTSHELL_CLIENTS.get(club_key)
     real_status = await ss_client.get_hosts_status() if ss_client else {}
     
@@ -537,7 +551,8 @@ async def pc_busy_alert(callback: CallbackQuery, state: FSMContext):
     place_name = callback.data.replace("pcbusy_", "")
     data = await state.get_data()
     real_status = data.get("real_status", {})
-    until = real_status.get(place_name, "занято")
+    norm_key = normalize_alias(place_name)
+    until = real_status.get(norm_key, "занято")
     await callback.answer(f"❌ Место {place_name} сейчас занято ({until})!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("togglepc_"), BookingStates.selecting_pcs)
