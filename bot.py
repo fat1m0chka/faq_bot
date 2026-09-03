@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import sys
+import aiohttp
+import json
+from datetime import datetime, timedelta
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -16,7 +20,7 @@ from aiogram.types import (
 )
 
 # ==========================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ И ТОКЕНОВ
+# 1. ЛОГИРОВАНИЕ И БАЗОВЫЕ НАСТРОЙКИ
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -26,12 +30,11 @@ logging.basicConfig(
 
 BOT_TOKEN = "8991533473:AAGhsAChSIVcOsbKjzCbhrSx7DFqGro2lPQ"
 
-# ⚠️ ЧИСЛОВЫЕ ID АДМИНИСТРАТОРОВ
-MY_TELEGRAM_ID = 5390254050             
-GREYDER_ADMIN_ID = 7508100064          
-KOMMUNIST_ADMIN_ID = 222222222         
+# Числовые Telegram ID для уведомлений
+MY_TELEGRAM_ID = 5390254050         # Владелец (@M1lfohks)
+GREYDER_ADMIN_ID = 7508100064      # Админ Грейдерной (@NextGenAst)
+KOMMUNIST_ADMIN_ID = 222222222     # Админ Коммунистической (@genesisvrast)
 
-# Жесткое разделение получателей:
 BRANCH_RECIPIENTS = {
     "loc_greyder": {GREYDER_ADMIN_ID, MY_TELEGRAM_ID},
     "loc_kommunist": {KOMMUNIST_ADMIN_ID, MY_TELEGRAM_ID},
@@ -44,10 +47,116 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ==========================================
-# 2. СТРУКТУРА МЕСТ ПО ТОЧКАМ
+# 2. ИНТЕГРАЦИЯ С SMARTSHELL API
 # ==========================================
+SMARTSHELL_URL = "https://billing.smartshell.gg/api/graphql"
 
-# Грейдерная, 1 (2 этаж)
+class SmartShellAPI:
+    def __init__(self, company_id: int, login_phone: str, password: str):
+        self.company_id = company_id
+        self.login_phone = login_phone
+        self.password = password
+        self.token = None
+        self.token_expire_time = None
+        self.headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"company_id={self.company_id}"
+        }
+
+    async def ensure_auth(self, session: aiohttp.ClientSession) -> bool:
+        """Авторизация и сохранение JWT-токена"""
+        now = datetime.now()
+        if self.token and self.token_expire_time and now < self.token_expire_time:
+            return True
+
+        mutation = """
+        mutation Login($input: LoginInput!) {
+            login(input: $input) {
+                access_token
+            }
+        }
+        """
+        variables = {
+            "input": {
+                "login": self.login_phone,
+                "password": self.password,
+                "company_id": int(self.company_id)
+            }
+        }
+
+        try:
+            async with session.post(SMARTSHELL_URL, json={"query": mutation, "variables": variables}, headers=self.headers, timeout=5) as resp:
+                if resp.status != 200:
+                    logging.error(f"SmartShell Login HTTP Error {resp.status}")
+                    return False
+                data = await resp.json()
+                if "errors" in data:
+                    logging.error(f"SmartShell Login GraphQL Error: {data['errors']}")
+                    return False
+
+                self.token = data["data"]["login"]["access_token"]
+                self.headers["Authorization"] = f"Bearer {self.token}"
+                # Считаем токен валидным в течение 12 часов
+                self.token_expire_time = datetime.now() + timedelta(hours=12)
+                logging.info(f"SmartShell: токен успешно обновлен для company_id={self.company_id}")
+                return True
+        except Exception as e:
+            logging.error(f"SmartShell connection exception: {e}")
+            return False
+
+    async def get_hosts_status(self) -> dict:
+        """Возвращает словарь: {alias_места: "до HH:MM" или None}"""
+        status_map = {}
+        if not self.company_id or not self.login_phone:
+            return status_map
+
+        query = """
+        query GetHosts {
+            hosts {
+                id
+                alias
+                client_sessions {
+                    id
+                    status
+                    time_left
+                }
+            }
+        }
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                if not await self.ensure_auth(session):
+                    return status_map
+
+                async with session.post(SMARTSHELL_URL, json={"query": query}, headers=self.headers, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        hosts = data.get("data", {}).get("hosts", []) or []
+                        for h in hosts:
+                            alias = str(h.get("alias", "")).strip()
+                            sessions = h.get("client_sessions", []) or []
+                            # Находим сессию с активным таймером
+                            active = [s for s in sessions if s.get("time_left") and s.get("time_left") > 0]
+                            if active:
+                                sec_left = active[0]["time_left"]
+                                end_dt = datetime.now() + timedelta(seconds=sec_left)
+                                status_map[alias] = f"до ~{end_dt.strftime('%H:%M')}"
+                            else:
+                                status_map[alias] = None
+        except Exception as e:
+            logging.error(f"Ошибка получения хостов SmartShell: {e}")
+
+        return status_map
+
+# Клиенты SmartShell по филиалам
+SMARTSHELL_CLIENTS = {
+    "loc_greyder": SmartShellAPI(3489, "79968370695", "йфцыув321"),
+    "loc_kommunist": SmartShellAPI(0, "", "")  # Впишете данные когда будет доступ
+}
+
+# ==========================================
+# 3. СТРУКТУРА МЕСТ ПО ТОЧКАМ
+# ==========================================
 GREYDER_ZONES = {
     "VIP Пятерка": ["4", "5", "6", "7", "8"],
     "VIP Четверка": ["9", "10", "11", "12"],
@@ -58,7 +167,6 @@ GREYDER_ZONES = {
     "🎮 Зона PlayStation 5": ["PS5 №1", "PS5 №2"],
 }
 
-# Коммунистическая, 7
 KOMMUNIST_ZONES = {
     "Bootcamp 1 (ПК 6-12)": ["6", "7", "8", "9", "10", "11", "12"],
     "Четверка (ПК 2-5)": ["2", "3", "4", "5"],
@@ -72,19 +180,12 @@ KOMMUNIST_ZONES = {
     "🥽 VR Площадки (4 зоны)": ["VR №1", "VR №2", "VR №3", "VR №4"],
 }
 
-PC_STATUS_GREYDER = {place: None for places in GREYDER_ZONES.values() for place in places}
-PC_STATUS_KOMMUNIST = {place: None for places in KOMMUNIST_ZONES.values() for place in places}
-
-# ==========================================
-# 3. ДАННЫЕ ФИЛИАЛОВ И ЖЕЛЕЗО
-# ==========================================
 CLUBS = {
     "loc_greyder": {
         "name": "📍 Грейдерная, 1 (2 этаж)",
         "phone": "+7 960 856 06 14",
         "admin_tg": "@NextGenAst",
         "zones": GREYDER_ZONES,
-        "pc_status": PC_STATUS_GREYDER,
         "price_photo": "price_greyder.jpg",
         "info_caption": (
             "🏢 <b>Филиал на ул. Грейдерная, 1 (2 этаж)</b>\n\n"
@@ -107,7 +208,6 @@ CLUBS = {
         "phone": "89064560613",
         "admin_tg": "@genesisvrast",
         "zones": KOMMUNIST_ZONES,
-        "pc_status": PC_STATUS_KOMMUNIST,
         "price_photo": "price_kommunist.jpg",
         "info_caption": (
             "🏢 <b>Филиал на ул. Коммунистическая, 7</b>\n\n"
@@ -127,9 +227,6 @@ CLUBS = {
     }
 }
 
-def is_super_admin(user: types.User) -> bool:
-    return user.id == MY_TELEGRAM_ID
-
 def is_admin(user: types.User) -> bool:
     return user.id in ALL_ADMIN_IDS
 
@@ -142,11 +239,6 @@ class BookingStates(StatesGroup):
     duration = State()
     phone = State()
 
-class AdminSetPCStates(StatesGroup):
-    loc = State()
-    pc = State()
-    until_time = State()
-
 class FeedbackStates(StatesGroup):
     loc = State()
     text = State()
@@ -155,9 +247,8 @@ class BroadcastStates(StatesGroup):
     message = State()
 
 # ==========================================
-# 4. КЛАВИАТУРЫ
+# 4. ДИНАМИЧЕСКИЕ КЛАВИАТУРЫ (ПО SMARTSHELL)
 # ==========================================
-
 def get_main_keyboard(user: types.User) -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="⚡ Забронировать ПК / PS5 / VR 📍")],
@@ -165,7 +256,7 @@ def get_main_keyboard(user: types.User) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🎮 Список игр"), KeyboardButton(text="☎️ Контакты и адреса")],
     ]
     if is_admin(user):
-        kb.append([KeyboardButton(text="🔒 Админ-панель")])
+        kb.append([KeyboardButton(text="📢 Сделать рассылку")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_location_select_kb(action_prefix: str) -> InlineKeyboardMarkup:
@@ -175,18 +266,18 @@ def get_location_select_kb(action_prefix: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def get_club_zones_keyboard(club_key: str) -> InlineKeyboardMarkup:
+# Клавиатура зон с проверкой занятости по данным SmartShell
+def get_club_zones_keyboard(club_key: str, real_status: dict) -> InlineKeyboardMarkup:
     club = CLUBS[club_key]
     zones = club["zones"]
-    pc_status = club["pc_status"]
     
     buttons = []
     for zone_name, places in zones.items():
-        busy_places = [p for p in places if pc_status[p] is not None]
+        # Считаем сколько мест занято в шелле
+        busy_places = [p for p in places if real_status.get(p) is not None]
         
         if len(busy_places) == len(places):
-            max_until = max([pc_status[p] for p in places])
-            btn_text = f"🔒 {zone_name} (занята до {max_until})"
+            btn_text = f"🔒 {zone_name} (занята)"
             callback = f"zonebusy_{zone_name}"
         else:
             free_count = len(places) - len(busy_places)
@@ -198,19 +289,19 @@ def get_club_zones_keyboard(club_key: str) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_action")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_multi_pcs_keyboard(club_key: str, zone_name: str, selected_list: list) -> InlineKeyboardMarkup:
+# Клавиатура конкретных мест внутри зоны со статусом из SmartShell
+def get_multi_pcs_keyboard(club_key: str, zone_name: str, selected_list: list, real_status: dict) -> InlineKeyboardMarkup:
     club = CLUBS[club_key]
     places = club["zones"][zone_name]
-    pc_status = club["pc_status"]
     
     buttons = []
     for place in places:
-        until = pc_status[place]
+        busy_info = real_status.get(place)
         prefix = "ПК" if "PS5" not in place and "VR" not in place else ""
         label = f"{prefix} {place}".strip()
         
-        if until:
-            btn_text = f"🔴 {label} (до {until})"
+        if busy_info:
+            btn_text = f"🔴 {label} ({busy_info})"
             callback = f"pcbusy_{place}"
         elif place in selected_list:
             btn_text = f"✅ {label} (ВЫБРАН)"
@@ -236,9 +327,8 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отменить")]], resize_keyboard=True)
 
 # ==========================================
-# 5. ОСНОВНЫЕ ОБРАБОТЧИКИ МЕНЮ
+# 5. ОСНОВНЫЕ ОБРАБОТЧИКИ
 # ==========================================
-
 @dp.message(CommandStart())
 @dp.message(F.text == "🔄 Вернуться в меню")
 @dp.message(F.text == "❌ Отменить")
@@ -246,9 +336,6 @@ async def cmd_start_or_back(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     USERS_DB.add(user_id)
-    
-    if is_admin(message.from_user):
-        logging.info(f"Администратор написал боту: ID={user_id}, @{message.from_user.username}")
 
     menu = get_main_keyboard(message.from_user)
     await message.answer(
@@ -282,7 +369,7 @@ async def send_club_info(callback: CallbackQuery):
             parse_mode="HTML"
         )
     except Exception as e:
-        logging.error(f"Ошибка отправки фото: {e}")
+        logging.error(f"Ошибка фото: {e}")
         await callback.message.answer(club["info_caption"], reply_markup=get_back_keyboard(), parse_mode="HTML")
     await callback.answer()
 
@@ -383,55 +470,64 @@ async def process_feedback(message: types.Message, state: FSMContext):
     await message.answer("Спасибо! Передали заявку админам филиала 🙌", reply_markup=get_main_keyboard(user))
 
 # ==========================================
-# 6. БРОНИРОВАНИЕ С ЧЕТКИМ РАЗДЕЛЕНИЕМ ПО ТОЧКАМ
+# 6. БРОНИРОВАНИЕ С ЖИВЫМ API SMARTSHELL
 # ==========================================
-
 @dp.message(F.text == "⚡ Забронировать ПК / PS5 / VR 📍")
 async def start_booking(message: types.Message, state: FSMContext):
     await state.set_state(BookingStates.location)
     await message.answer("Выберите филиал для бронирования:", reply_markup=get_location_select_kb("bookloc"))
 
+# 1. Запрос статусов из SmartShell и показ зон
 @dp.callback_query(F.data.startswith("bookloc_"), BookingStates.location)
 async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
     club_key = callback.data.replace("bookloc_", "")
-    await state.update_data(location=CLUBS[club_key]["name"], loc_key=club_key)
+    await callback.message.edit_text("⏳ <i>Синхронизируем доступность ПК со SmartShell...</i>", parse_mode="HTML")
+
+    # Опрашиваем SmartShell
+    ss_client = SMARTSHELL_CLIENTS.get(club_key)
+    real_status = await ss_client.get_hosts_status() if ss_client else {}
+    
+    await state.update_data(location=CLUBS[club_key]["name"], loc_key=club_key, real_status=real_status)
     await state.set_state(BookingStates.zone)
     
     await callback.message.edit_text(
         f"<b>{CLUBS[club_key]['name']}</b>\nВыберите свободную зону, PS5 или VR:",
-        reply_markup=get_club_zones_keyboard(club_key),
+        reply_markup=get_club_zones_keyboard(club_key, real_status),
         parse_mode="HTML"
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("zonebusy_"), BookingStates.zone)
 async def zone_busy_alert(callback: CallbackQuery):
-    await callback.answer("❌ Вся эта зона полностью занята! Выберите другую.", show_alert=True)
+    await callback.answer("❌ Вся эта зона сейчас занята гостями в клубе!", show_alert=True)
 
 @dp.callback_query(F.data == "back_to_zones", BookingStates.selecting_pcs)
 async def back_to_zones_handler(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     club_key = data["loc_key"]
+    real_status = data.get("real_status", {})
     await state.set_state(BookingStates.zone)
     await callback.message.edit_text(
         f"<b>{CLUBS[club_key]['name']}</b>\nВыберите зону:",
-        reply_markup=get_club_zones_keyboard(club_key),
+        reply_markup=get_club_zones_keyboard(club_key, real_status),
         parse_mode="HTML"
     )
     await callback.answer()
 
+# 2. Выбор мест в комнате (со статусами SmartShell)
 @dp.callback_query(F.data.startswith("selectzone_"), BookingStates.zone)
 async def choose_pc_in_zone(callback: CallbackQuery, state: FSMContext):
     zone_name = callback.data.replace("selectzone_", "")
     data = await state.get_data()
     club_key = data["loc_key"]
+    real_status = data.get("real_status", {})
     
     await state.update_data(zone=zone_name, selected_pcs=[])
     await state.set_state(BookingStates.selecting_pcs)
     
     await callback.message.edit_text(
-        f"Выбрано: <b>{zone_name}</b>\nНажмите на нужные места (можно выбрать несколько):",
-        reply_markup=get_multi_pcs_keyboard(club_key, zone_name, []),
+        f"Выбрано: <b>{zone_name}</b>\nЗеленые места свободны. Нажмите на нужные (можно выбрать несколько):",
+        reply_markup=get_multi_pcs_keyboard(club_key, zone_name, [], real_status),
         parse_mode="HTML"
     )
     await callback.answer()
@@ -440,9 +536,9 @@ async def choose_pc_in_zone(callback: CallbackQuery, state: FSMContext):
 async def pc_busy_alert(callback: CallbackQuery, state: FSMContext):
     place_name = callback.data.replace("pcbusy_", "")
     data = await state.get_data()
-    club_key = data["loc_key"]
-    until = CLUBS[club_key]["pc_status"][place_name]
-    await callback.answer(f"❌ Место {place_name} занято до {until}!", show_alert=True)
+    real_status = data.get("real_status", {})
+    until = real_status.get(place_name, "занято")
+    await callback.answer(f"❌ Место {place_name} сейчас занято ({until})!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("togglepc_"), BookingStates.selecting_pcs)
 async def toggle_pc_selection(callback: CallbackQuery, state: FSMContext):
@@ -450,6 +546,7 @@ async def toggle_pc_selection(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     club_key = data["loc_key"]
     zone_name = data["zone"]
+    real_status = data.get("real_status", {})
     selected = data.get("selected_pcs", [])
     
     if place_name in selected:
@@ -459,7 +556,7 @@ async def toggle_pc_selection(callback: CallbackQuery, state: FSMContext):
         
     await state.update_data(selected_pcs=selected)
     await callback.message.edit_reply_markup(
-        reply_markup=get_multi_pcs_keyboard(club_key, zone_name, selected)
+        reply_markup=get_multi_pcs_keyboard(club_key, zone_name, selected, real_status)
     )
     await callback.answer()
 
@@ -522,7 +619,7 @@ async def booking_phone(message: types.Message, state: FSMContext):
         ]
     )
     admin_card = (
-        "🚨 <b>НОВАЯ ЗАЯВКА НА БРОНЬ</b>\n\n"
+        "🚨 <b>НОВАЯ ЗАЯВКА НА БРОНЬ (SmartShell)</b>\n\n"
         f"🏢 <b>Филиал:</b> {data['location']}\n"
         f"🎯 <b>Места:</b> {data['zone']} 👉 <b>{data['pc_number']}</b>\n"
         f"👤 <b>Клиент:</b> {user.full_name} ({username_str})\n"
@@ -532,7 +629,7 @@ async def booking_phone(message: types.Message, state: FSMContext):
     )
     
     recipients = BRANCH_RECIPIENTS.get(loc_key, {MY_TELEGRAM_ID})
-    logging.info(f"👉 Отправка брони филиала {loc_key} на ID адресатов: {recipients}")
+    logging.info(f"👉 Отправка брони {loc_key} на ID: {recipients}")
 
     for adm_chat_id in recipients:
         try:
@@ -544,7 +641,6 @@ async def booking_phone(message: types.Message, state: FSMContext):
 # ==========================================
 # 7. ДЕЙСТВИЯ АДМИНИСТРАТОРА
 # ==========================================
-
 @dp.callback_query(F.data.startswith("adm_ok_"))
 async def admin_approve(callback: CallbackQuery):
     if not is_admin(callback.from_user):
@@ -576,122 +672,14 @@ async def admin_reject(callback: CallbackQuery):
     await callback.answer("Отклонено!")
 
 # ==========================================
-# 8. ПАНЕЛЬ УПРАВЛЕНИЯ КЛУБОМ
+# 8. РАССЫЛКА
 # ==========================================
-
-@dp.message(F.text == "🔒 Админ-панель")
-async def admin_panel(message: types.Message):
+@dp.message(F.text == "📢 Сделать рассылку")
+async def start_broadcast(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user):
-        return
-
-    buttons = [
-        [InlineKeyboardButton(text="🕹 Управление местами (Грейдерная)", callback_data="adm_manage_loc_greyder")],
-        [InlineKeyboardButton(text="🕹 Управление местами (Коммунистическая)", callback_data="adm_manage_loc_kommunist")],
-        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="adm_broadcast")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")]
-    ]
-    await message.answer("🛠 <b>Панель управления сетью:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("adm_manage_loc_"))
-async def adm_manage_pcs_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user):
-        return
-
-    club_key = callback.data.replace("adm_manage_", "")
-    club = CLUBS[club_key]
-    pc_status = club["pc_status"]
-
-    buttons = []
-    row = []
-    for place in sorted(pc_status.keys(), key=lambda x: (x.isdigit(), int(x) if x.isdigit() else x)):
-        status_icon = f"🔴 {place} ({pc_status[place]})" if pc_status[place] else f"🟢 {place}"
-        row.append(InlineKeyboardButton(text=status_icon, callback_data=f"admpcset_{club_key}_{place}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton(text="🔄 Сбросить ВСЕ брони точки", callback_data=f"adm_reset_all_{club_key}")])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_action")])
-
-    await callback.message.edit_text(
-        f"🕹 <b>Управление местами ({club['name']}):</b>\nНажмите на ПК / PS5 / VR для изменения статуса:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("admpcset_"))
-async def adm_toggle_pc(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user):
-        return
-    _, club_key, place_name = callback.data.split("_", 2)
-    pc_status = CLUBS[club_key]["pc_status"]
-    
-    if pc_status[place_name] is not None:
-        pc_status[place_name] = None
-        await callback.answer(f"✅ {place_name} теперь свободно!")
-        callback.data = f"adm_manage_{club_key}"
-        await adm_manage_pcs_list(callback)
-    else:
-        await state.set_state(AdminSetPCStates.until_time)
-        await state.update_data(loc=club_key, pc=place_name)
-        await callback.message.answer(
-            f"Укажите время, до которого занято <b>{place_name}</b> ({CLUBS[club_key]['name']})\nНапример: <code>21:30</code>:",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-        await callback.answer()
-
-@dp.message(AdminSetPCStates.until_time)
-async def adm_save_pc_time(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user):
-        return
-    data = await state.get_data()
-    club_key = data["loc"]
-    place_name = data["pc"]
-    until_time = message.text.strip()
-    
-    CLUBS[club_key]["pc_status"][place_name] = until_time
-    await state.clear()
-    
-    await message.answer(
-        f"🔴 <b>{place_name}</b> ({CLUBS[club_key]['name']}) помечено занятым до <b>{until_time}</b>!",
-        reply_markup=get_main_keyboard(message.from_user),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("adm_reset_all_"))
-async def adm_reset_all(callback: CallbackQuery):
-    if not is_admin(callback.from_user):
-        return
-    club_key = callback.data.replace("adm_reset_all_", "")
-    for place in CLUBS[club_key]["pc_status"]:
-        CLUBS[club_key]["pc_status"][place] = None
-    await callback.answer("✅ Все места точки освобождены!", show_alert=True)
-    callback.data = f"adm_manage_{club_key}"
-    await adm_manage_pcs_list(callback)
-
-@dp.callback_query(F.data == "adm_stats")
-async def show_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user):
-        return
-    await callback.message.answer(
-        f"📊 <b>Статистика сети:</b>\n\n"
-        f"👥 Всего пользователей бота: <b>{len(USERS_DB)}</b> чел.\n"
-        f"Администраторов в конфиге: <b>{len(ALL_ADMIN_IDS)}</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "adm_broadcast")
-async def start_broadcast(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user):
         return
     await state.set_state(BroadcastStates.message)
-    await callback.message.answer("📢 Напишите текст рассылки для всех пользователей:", reply_markup=get_cancel_keyboard())
-    await callback.answer()
+    await message.answer("📢 Напишите текст рассылки для всех пользователей:", reply_markup=get_cancel_keyboard())
 
 @dp.message(BroadcastStates.message)
 async def send_broadcast(message: types.Message, state: FSMContext):
@@ -705,7 +693,7 @@ async def send_broadcast(message: types.Message, state: FSMContext):
             sent_count += 1
             await asyncio.sleep(0.05)
         except Exception as e:
-            logging.error(f"Ошибка рассылки юзеру {uid}: {e}")
+            logging.error(f"Ошибка рассылки {uid}: {e}")
 
     menu = get_main_keyboard(message.from_user)
     await message.answer(f"✅ Рассылка доставлена: <b>{sent_count}</b> чел.", reply_markup=menu, parse_mode="HTML")
@@ -714,7 +702,7 @@ async def send_broadcast(message: types.Message, state: FSMContext):
 # 9. ЗАПУСК БОТА
 # ==========================================
 async def main():
-    logging.info("Бот успешно запущен и готов к работе.")
+    logging.info("Бот успешно запущен со SmartShell API.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
