@@ -263,15 +263,6 @@ class SmartShellAPI:
         if not cid:
             return False, "SmartShell не привязан к этому клубу."
 
-        # Исправление бага "from must be after":
-        # Берем чистое время UTC и добавляем безопасный сдвиг вперед (+20 минут), чтобы не попасть в прошлое
-        now_utc = datetime.now(timezone.utc)
-        dt_from = now_utc + timedelta(minutes=20)
-        dt_to = dt_from + timedelta(hours=2)
-
-        iso_from = dt_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        iso_to = dt_to.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
         host_ids = []
         for p in places_list:
             key = normalize_alias(p)
@@ -285,6 +276,10 @@ class SmartShellAPI:
         if not host_ids:
             return False, "Выбранные ПК не найдены в базе оборудования."
 
+        # Начальная точка: через 20 минут в UTC
+        dt_from = datetime.now(timezone.utc) + timedelta(minutes=20)
+        dt_to = dt_from + timedelta(hours=2)
+
         mutation = """
         mutation CreateBooking($input: BookingInput!) {
             createBooking(input: $input) {
@@ -293,14 +288,6 @@ class SmartShellAPI:
             }
         }
         """
-        variables = {
-            "input": {
-                "hosts": host_ids,
-                "from": iso_from,
-                "to": iso_to,
-                "comment": f"ТГ-Бот | Клиент: {client_name} | Тел: {client_phone} | {time_info}",
-            }
-        }
 
         async with aiohttp.ClientSession() as session:
             if not await self.ensure_auth(session):
@@ -311,19 +298,46 @@ class SmartShellAPI:
                 "User-Agent": f"company_id={cid}",
                 "Authorization": f"Bearer {self.token}",
             }
-            try:
-                async with session.post(SMARTSHELL_URL, json={"query": mutation, "variables": variables}, headers=headers, timeout=8) as resp:
-                    res = await resp.json()
-                    if "errors" in res:
-                        err_msg = res["errors"][0].get("message", "Ошибка API")
-                        return False, f"❌ Отказ SmartShell: {err_msg}"
 
-                    booking_id = res.get("data", {}).get("createBooking", {}).get("id")
-                    status_res = res.get("data", {}).get("createBooking", {}).get("status", "OK")
-                    return True, f"✅ Создана бронь в SmartShell: #{booking_id} ({status_res})"
-            except Exception as err:
-                logging.error(f"Ошибка запроса createBooking: {err}")
-                return False, f"❌ Исключение при отправке брони: {err}"
+            # 2 попытки: при ошибке "from must be after" сдвигаем время на то, что требует шелл + 2 минуты
+            for attempt in range(2):
+                iso_from = dt_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                iso_to = dt_to.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+                variables = {
+                    "input": {
+                        "hosts": host_ids,
+                        "from": iso_from,
+                        "to": iso_to,
+                        "comment": f"ТГ-Бот | Клиент: {client_name} | Тел: {client_phone} | {time_info}",
+                    }
+                }
+
+                try:
+                    async with session.post(SMARTSHELL_URL, json={"query": mutation, "variables": variables}, headers=headers, timeout=8) as resp:
+                        res = await resp.json()
+                        if "errors" in res:
+                            err_msg = res["errors"][0].get("message", "Ошибка API")
+                            
+                            # Автоматический перехват бага валидации времени
+                            match = re.search(r"after\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", err_msg)
+                            if match and attempt == 0:
+                                parsed_req = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                                dt_from = parsed_req + timedelta(minutes=2)
+                                dt_to = dt_from + timedelta(hours=2)
+                                logging.info(f"SmartShell запросил сдвиг даты: переотправка с {dt_from}")
+                                continue
+
+                            return False, f"❌ Отказ SmartShell: {err_msg}"
+
+                        booking_id = res.get("data", {}).get("createBooking", {}).get("id")
+                        status_res = res.get("data", {}).get("createBooking", {}).get("status", "OK")
+                        return True, f"✅ Создана бронь в SmartShell: #{booking_id} ({status_res})"
+                except Exception as err:
+                    logging.error(f"Ошибка запроса createBooking: {err}")
+                    return False, f"❌ Исключение при отправке брони: {err}"
+
+        return False, "Не удалось согласовать время брони с сервером SmartShell."
 
 
 CLIENTS = {
@@ -593,7 +607,7 @@ async def start_booking(message: types.Message, state: FSMContext):
 async def booking_location_chosen(callback: CallbackQuery, state: FSMContext):
     club_key = callback.data.replace("bookloc_", "")
     
-    # Сразу получаем реальные статусы
+    # Сразу получаем реальные статусы из шелла
     client = CLIENTS.get(club_key)
     real_status = await client.get_hosts_status() if client else {}
 
@@ -738,7 +752,7 @@ async def booking_phone(message: types.Message, state: FSMContext):
     user = message.from_user
     username_str = f"@{user.username}" if user.username else "нет username"
 
-    # Сохраняем в буфер для SmartShell
+    # Сохраняем в буфер для передачи данных в шелл
     PENDING_ORDERS[user.id] = {
         "loc_key": loc_key,
         "places": data.get("raw_places", []),
